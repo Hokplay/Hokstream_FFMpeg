@@ -37,6 +37,10 @@
 #if CONFIG_LIBXCB_SHAPE
 #include <xcb/shape.h>
 #endif
+#if CONFIG_LIBNPP                   /*  <<< NEW  */
+#include <cuda_runtime.h>
+#include <nppi_color_conversion.h>
+#endif                              /*  >>> NEW  */
 
 #include "libavutil/internal.h"
 #include "libavutil/mathematics.h"
@@ -474,7 +478,31 @@ static int xcbgrab_read_packet(AVFormatContext *s, AVPacket *pkt)
         ret = xcbgrab_frame(s, pkt);
     pkt->dts = pkt->pts = pts;
     pkt->duration = c->frame_duration;
-
+#if CONFIG_LIBNPP                   /*  <<< NEW — call helper */
+    /* Convert on‑GPU when source is BGR0 */
+    if (ret >= 0 && s->streams[0]->codecpar->format == AV_PIX_FMT_BGR0) {
+            const int y_size  = c->width * c->height;
+            const int uv_size = y_size >> 2;                    /* w*h/4 */
+    
+            AVPacket yuv_pkt;
+            if (av_new_packet(&yuv_pkt, y_size + uv_size * 2) == 0) {
+                uint8_t *dstY = yuv_pkt.data;
+                uint8_t *dstU = dstY + y_size;
+                uint8_t *dstV = dstU + uv_size;
+    
+                if (!bgr0_to_yuv420p_gpu(dstY, dstU, dstV,
+                                         pkt->data,
+                                         c->width, c->height)) {
+                    /* swap packets → caller sees YUV420P */
+                    av_packet_unref(pkt);
+                    *pkt = yuv_pkt;
+                    s->streams[0]->codecpar->format = AV_PIX_FMT_YUV420P;
+                } else {
+                    av_packet_unref(&yuv_pkt); /* fall back silently */
+                }
+            }
+        }
+#endif 
 #if CONFIG_LIBXCB_XFIXES
     if (ret >= 0 && c->draw_mouse && p->same_screen)
         xcbgrab_draw_mouse(s, pkt, p, geo, win_x, win_y);
@@ -815,7 +843,59 @@ fail:
     xcb_free_gc(conn, gc);
     return ret;
 }
+#if CONFIG_LIBNPP                   /*  <<< NEW — GPU helper  */
+/**
++ * GPU‑accelerated conversion: host BGR0 → planar YUV 4:2:0
++ */
+static int bgr0_to_yuv420p_gpu(uint8_t       *dstY,
+                               uint8_t       *dstU,
+                               uint8_t       *dstV,
+                               const uint8_t *src,
+                               int            width,
+                               int            height)
+{
+    const int srcPitch  = width * 4;        /* BGRA */
+    const int pitchY    = width;
+    const int pitchUV   = width >> 1;
+    NppiSize roi        = { width, height };
 
+    uint8_t *d_src = NULL, *d_y = NULL, *d_u = NULL, *d_v = NULL;
+    size_t   d_srcPitch, d_pitchY, d_pitchUV;
+
+    if (  cudaMallocPitch(&d_src, &d_srcPitch, srcPitch, height) ||
+          cudaMallocPitch(&d_y,   &d_pitchY,   pitchY,   height) ||
+          cudaMallocPitch(&d_u,   &d_pitchUV,  pitchUV,  height >> 1) ||
+          cudaMallocPitch(&d_v,   &d_pitchUV,  pitchUV,  height >> 1) )
+        goto fail;
+
+    cudaMemcpy2D(d_src, d_srcPitch, src, srcPitch, srcPitch, height,
+                 cudaMemcpyHostToDevice);
+
+    if (nppiBGRToYUV420_8u_AC4P3R(d_src, (int)d_srcPitch,
+                                  d_y,   (int)d_pitchY,
+                                  d_u,   (int)d_pitchUV,
+                                  d_v,   (int)d_pitchUV,
+                                  roi) != NPP_SUCCESS)
+        goto fail;
+
+    cudaMemcpy2D(dstY, pitchY,  d_y, d_pitchY,  pitchY,  height,
+                 cudaMemcpyDeviceToHost);
+    cudaMemcpy2D(dstU, pitchUV, d_u, d_pitchUV, pitchUV, height >> 1,
+                 cudaMemcpyDeviceToHost);
+    cudaMemcpy2D(dstV, pitchUV, d_v, d_pitchUV, pitchUV, height >> 1,
+                 cudaMemcpyDeviceToHost);
+
+    cudaFree(d_src); cudaFree(d_y); cudaFree(d_u); cudaFree(d_v);
+    return 0;
+
+fail:
+    if (d_src) cudaFree(d_src);
+    if (d_y)   cudaFree(d_y);
+    if (d_u)   cudaFree(d_u);
+    if (d_v)   cudaFree(d_v);
+    return AVERROR_EXTERNAL;
+}
+#endif      
 static av_cold int xcbgrab_read_header(AVFormatContext *s)
 {
     XCBGrabContext *c = s->priv_data;
@@ -842,6 +922,7 @@ static av_cold int xcbgrab_read_header(AVFormatContext *s)
                s->url[0] ? s->url : "default", ret);
         return AVERROR(EIO);
     }
+                        /*  >>> NEW  */
 
     setup = xcb_get_setup(c->conn);
 
