@@ -44,3 +44,15 @@ GPL. Please refer to the LICENSE file for detailed information.
 Patches should be submitted to the ffmpeg-devel mailing list using
 `git format-patch` or `git send-email`. Github pull requests should be
 avoided because they are not part of our review process and will be ignored.
+
+## compile ##
+git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
+cd nv-codec-headers && sudo make install && cd –
+sudo apt-get install build-essential yasm cmake libtool libc6 libc6-dev unzip wget libnuma1 libnuma-dev
+./configure \
+  --enable-gpl \
+  --enable-nonfree \
+  --enable-libnpp \
+  --extra-cflags="-I/usr/local/cuda12-8/include" \
+  --extra-ldflags="-L/usr/local/cuda12-8/lib64" \
+  --extra-libs="-lcudart -lnppig -lnppicc -lnppc" # Add other NPP libs if needed
