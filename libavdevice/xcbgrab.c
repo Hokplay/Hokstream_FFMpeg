@@ -448,7 +448,7 @@
      int64_t pts;
      int win_x = 0, win_y = 0;
 
-     pts = wait_frame(s, pkt);
+     wait_frame(s, pkt);
 
      if (c->follow_mouse || c->draw_mouse) {
          pc  = xcb_query_pointer(c->conn, c->window_id != XCB_NONE ? c->window_id : c->screen->root);
@@ -504,8 +504,9 @@
          goto end;
      }
 
-     pkt->dts = pkt->pts = pts;
-     pkt->duration = c->frame_duration;
+    pkt->pts = c->time_frame - c->frame_duration;
+    pkt->dts = pkt->pts; // For raw video, DTS is usually same as PTS
+    pkt->duration = c->frame_duration;
 
  #if CONFIG_LIBXCB_XFIXES
      if (ret >= 0 && c->draw_mouse && p && p->same_screen) {
@@ -529,9 +530,13 @@
              if (!bgr0_to_yuv420p_gpu(dstY, dstU, dstV,
                                       pkt->data,
                                       c->width, c->height)) {
-                 av_packet_copy_props(&yuv_pkt, pkt);
-                 av_packet_unref(pkt);
-                 *pkt = yuv_pkt;
+                                        yuv_pkt.pts = pkt->pts;
+                                        yuv_pkt.dts = pkt->dts;
+                                        yuv_pkt.duration = pkt->duration;
+                                        // av_packet_copy_props(&yuv_pkt, pkt); // This copies more than just timestamps
+                        
+                                        av_packet_unref(pkt);
+                                        *pkt = yuv_pkt;
              } else {
                  av_log(s, AV_LOG_ERROR, "NPP BGR0 to YUV420P conversion failed for a frame.\n");
                  av_packet_unref(&yuv_pkt);
