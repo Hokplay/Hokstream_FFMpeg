@@ -938,87 +938,106 @@ end:
      return ret;
  }
 
- #if CONFIG_LIBNPP
- /**
- + * GPU‑accelerated conversion: host BGR0 → planar YUV 4:2:0
- + */
- static int bgr0_to_yuv420p_gpu(uint8_t       *dstY,
-                                uint8_t       *dstU,
-                                uint8_t       *dstV,
-                                const uint8_t *src,
-                                int            width,
-                                int            height)
- {
-     const int srcPitch  = width * 4;
-     const int pitchY    = width;
-     const int pitchUV   = width >> 1;
-     NppiSize roi        = { width, height };
+ 
+#if CONFIG_LIBNPP
+/**
+ * GPU-accelerated conversion: host BGR0 → planar YUV 4:2:0
+ * Fixed version with proper synchronization
+ */
+static int bgr0_to_yuv420p_gpu(uint8_t       *dstY,
+                               uint8_t       *dstU,
+                               uint8_t       *dstV,
+                               const uint8_t *src,
+                               int            width,
+                               int            height)
+{
+    const int srcPitch  = width * 4;
+    const int pitchY    = width;
+    const int pitchUV   = width >> 1;
+    NppiSize roi        = { width, height };
 
-     uint8_t *d_src = NULL, *d_y = NULL, *d_u = NULL, *d_v = NULL;
-     size_t   d_srcPitch = 0, d_pitchY = 0, d_pitchUV = 0;
+    uint8_t *d_src = NULL, *d_y = NULL, *d_u = NULL, *d_v = NULL;
+    size_t   d_srcPitch = 0, d_pitchY = 0, d_pitchUV = 0;
 
-     Npp8u *pDstPlanes_NPP[3];
-     int    pDstSteps_NPP[3];
-     cudaError_t cuda_err;
-     NppStatus npp_stat;
+    Npp8u *pDstPlanes_NPP[3];
+    int    pDstSteps_NPP[3];
+    cudaError_t cuda_err;
+    NppStatus npp_stat;
+    
+    // Create CUDA stream for this operation
+    cudaStream_t stream;
+    cuda_err = cudaStreamCreate(&stream);
+    if (cuda_err != cudaSuccess) {
+        av_log(NULL, AV_LOG_ERROR, "cudaStreamCreate failed: %s\n", cudaGetErrorString(cuda_err));
+        return AVERROR_EXTERNAL;
+    }
 
-     // Logging CUDA/NPP errors can be very verbose.
-     // Consider AV_LOG_DEBUG or conditional logging if these become problematic.
-     #define LOG_CUDA_ERROR(err, msg) if (err != cudaSuccess) { av_log(NULL, AV_LOG_ERROR, "%s: %s\n", msg, cudaGetErrorString(err)); goto fail; }
-     #define LOG_NPP_ERROR(stat, msg) if (stat != NPP_SUCCESS) { av_log(NULL, AV_LOG_ERROR, "%s: NPP error %d\n", msg, stat); goto fail; }
+    #define LOG_CUDA_ERROR(err, msg) if (err != cudaSuccess) { av_log(NULL, AV_LOG_ERROR, "%s: %s\n", msg, cudaGetErrorString(err)); goto fail; }
+    #define LOG_NPP_ERROR(stat, msg) if (stat != NPP_SUCCESS) { av_log(NULL, AV_LOG_ERROR, "%s: NPP error %d\n", msg, stat); goto fail; }
 
+    // Allocate GPU memory
+    cuda_err = cudaMallocPitch((void **)&d_src, &d_srcPitch, srcPitch, height);
+    LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_src failed");
+    cuda_err = cudaMallocPitch((void **)&d_y,   &d_pitchY,   pitchY,   height);
+    LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_y failed");
+    cuda_err = cudaMallocPitch((void **)&d_u,   &d_pitchUV,  pitchUV,  height >> 1);
+    LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_u failed");
+    cuda_err = cudaMallocPitch((void **)&d_v,   &d_pitchUV,  pitchUV,  height >> 1);
+    LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_v failed");
 
-     cuda_err = cudaMallocPitch((void **)&d_src, &d_srcPitch, srcPitch, height);
-     LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_src failed");
-     cuda_err = cudaMallocPitch((void **)&d_y,   &d_pitchY,   pitchY,   height);
-     LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_y failed");
-     cuda_err = cudaMallocPitch((void **)&d_u,   &d_pitchUV,  pitchUV,  height >> 1);
-     LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_u failed");
-     cuda_err = cudaMallocPitch((void **)&d_v,   &d_pitchUV,  pitchUV,  height >> 1); // Use same d_pitchUV for V plane
-     LOG_CUDA_ERROR(cuda_err, "cudaMallocPitch d_v failed");
+    // Copy input data to GPU with stream
+    cuda_err = cudaMemcpy2DAsync(d_src, d_srcPitch, src, srcPitch, srcPitch, height,
+                                cudaMemcpyHostToDevice, stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2DAsync d_src failed");
 
+    // Wait for copy to complete before NPP operation
+    cuda_err = cudaStreamSynchronize(stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaStreamSynchronize after H2D copy failed");
 
-     cuda_err = cudaMemcpy2D(d_src, d_srcPitch, src, srcPitch, srcPitch, height,
-                  cudaMemcpyHostToDevice);
-     LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2D d_src failed");
+    // Set up NPP conversion parameters
+    pDstPlanes_NPP[0] = d_y;
+    pDstPlanes_NPP[1] = d_u;
+    pDstPlanes_NPP[2] = d_v;
 
+    pDstSteps_NPP[0] = (int)d_pitchY;
+    pDstSteps_NPP[1] = (int)d_pitchUV;
+    pDstSteps_NPP[2] = (int)d_pitchUV;
 
-     pDstPlanes_NPP[0] = d_y;
-     pDstPlanes_NPP[1] = d_u;
-     pDstPlanes_NPP[2] = d_v;
+    // Perform NPP conversion
+    npp_stat = nppiBGRToYUV420_8u_AC4P3R(d_src, (int)d_srcPitch,
+                                         pDstPlanes_NPP, pDstSteps_NPP,
+                                         roi);
+    LOG_NPP_ERROR(npp_stat, "nppiBGRToYUV420_8u_AC4P3R failed");
 
-     pDstSteps_NPP[0] = (int)d_pitchY;
-     pDstSteps_NPP[1] = (int)d_pitchUV;
-     pDstSteps_NPP[2] = (int)d_pitchUV;
+    // Copy results back to host with stream
+    cuda_err = cudaMemcpy2DAsync(dstY, pitchY,  d_y, d_pitchY,  pitchY,  height,
+                                cudaMemcpyDeviceToHost, stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2DAsync dstY failed");
+    cuda_err = cudaMemcpy2DAsync(dstU, pitchUV, d_u, d_pitchUV, pitchUV, height >> 1,
+                                cudaMemcpyDeviceToHost, stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2DAsync dstU failed");
+    cuda_err = cudaMemcpy2DAsync(dstV, pitchUV, d_v, d_pitchUV, pitchUV, height >> 1,
+                                cudaMemcpyDeviceToHost, stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2DAsync dstV failed");
 
-     npp_stat = nppiBGRToYUV420_8u_AC4P3R(d_src, (int)d_srcPitch,
-                                   pDstPlanes_NPP, pDstSteps_NPP,
-                                   roi);
-     LOG_NPP_ERROR(npp_stat, "nppiBGRToYUV420_8u_AC4P3R failed");
+    // CRITICAL: Wait for all operations to complete
+    cuda_err = cudaStreamSynchronize(stream);
+    LOG_CUDA_ERROR(cuda_err, "cudaStreamSynchronize after D2H copy failed");
 
+    // Clean up
+    cudaStreamDestroy(stream);
+    cudaFree(d_src); cudaFree(d_y); cudaFree(d_u); cudaFree(d_v);
+    return 0;
 
-     cuda_err = cudaMemcpy2D(dstY, pitchY,  d_y, d_pitchY,  pitchY,  height,
-                  cudaMemcpyDeviceToHost);
-     LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2D dstY failed");
-     cuda_err = cudaMemcpy2D(dstU, pitchUV, d_u, d_pitchUV, pitchUV, height >> 1,
-                  cudaMemcpyDeviceToHost);
-     LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2D dstU failed");
-     cuda_err = cudaMemcpy2D(dstV, pitchUV, d_v, d_pitchUV, pitchUV, height >> 1,
-                  cudaMemcpyDeviceToHost);
-     LOG_CUDA_ERROR(cuda_err, "cudaMemcpy2D dstV failed");
-
-
-     cudaFree(d_src); cudaFree(d_y); cudaFree(d_u); cudaFree(d_v);
-     return 0;
-
- fail:
-     if (d_src) cudaFree(d_src);
-     if (d_y)   cudaFree(d_y);
-     if (d_u)   cudaFree(d_u);
-     if (d_v)   cudaFree(d_v);
-     return AVERROR_EXTERNAL;
- }
- #endif
+fail:
+    if (stream) cudaStreamDestroy(stream);
+    if (d_src) cudaFree(d_src);
+    if (d_y)   cudaFree(d_y);
+    if (d_u)   cudaFree(d_u);
+    if (d_v)   cudaFree(d_v);
+    return AVERROR_EXTERNAL;
+}
+#endif
 
  static av_cold int xcbgrab_read_header(AVFormatContext *s)
 {
